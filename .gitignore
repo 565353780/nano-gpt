@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 
 # dataset
-/data/shakespeare_char/
+/data/shakespeare_char/*.txt
+/data/shakespeare_char/*.pkl
+/data/shakespeare_char/*.bin
