@@ -34,4 +34,39 @@ python demo.py
 python train.py
 ```
 
+## Source Script
+
+Download mini dataset
+
+```bash
+python data/shakespeare_char/prepare.py
+```
+
+Train on mini dataset
+
+```bash
+python train.py config/train_shakespeare_char.py
+```
+
+Test trained model
+
+```bash
+python sample.py --out_dir=out-shakespeare-char
+```
+
+Finetune pretrained model
+
+```bash
+python train.py config/finetune_shakespeare.py
+```
+
+Inference
+
+```bash
+python sample.py \
+  --init_from=gpt2-xl \
+  --start="What is the answer to life, the universe, and everything?" \
+  --num_samples=5 --max_new_tokens=100
+```
+
 ## Enjoy it~
