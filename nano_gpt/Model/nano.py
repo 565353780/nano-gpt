@@ -106,7 +106,6 @@ class GPT(nn.Module):
         from transformers import GPT2LMHeadModel
         print(f"loading weights from pretrained gpt: {model_type}")
 
-        # n_layer, n_head and n_embd are determined from model_type
         config_args = {
             # 124M params
             'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),
@@ -118,16 +117,14 @@ class GPT(nn.Module):
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
         }[model_type]
         print("forcing vocab_size=50257, block_size=1024, bias=True")
-        # always 50257 for GPT model checkpoints
         config_args['vocab_size'] = 50257
-        # always 1024 for GPT model checkpoints
         config_args['block_size'] = 1024
-        config_args['bias'] = True  # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
+        config_args['bias'] = True
+
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
+
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
@@ -137,20 +134,22 @@ class GPT(nn.Module):
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        assert isinstance(model_hf, GPT2LMHeadModel)
         sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        # copy while ensuring no error in model
         sd_keys_hf = sd_hf.keys()
+        # ignore the buffer in keys
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(
-            '.attn.masked_bias')]  # ignore these, just a buffer
+            '.attn.masked_bias')]
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(
-            '.attn.bias')]  # same, just the mask (buffer)
+            '.attn.bias')]
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight',
                       'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(
-            sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+
+        # transpose Conv1D -> vanilla Linear
+        assert len(sd_keys_hf) == len(sd_keys), \
+            f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -165,30 +164,35 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self,
+                             weight_decay,
+                             learning_rate,
+                             betas,
+                             device_type):
         # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = dict(self.named_parameters())
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay
+        #      all biases and layernorms don't
+        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(
-            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(
-            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
+        print(f"num decayed parameter tensors: {len(decay_params)}, \
+            with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, \
+            with {num_nodecay_params:,} parameters")
+
         fused_available = 'fused' in inspect.signature(
             torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
+        extra_args = dict(fused=True) if use_fused else {}
         optimizer = torch.optim.AdamW(
             optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
@@ -196,44 +200,58 @@ class GPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        """
+        estimate model flops utilization (MFU)
+        in units of A100 bfloat16 peak FLOPS
+        """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        L = cfg.n_layer
+        H = cfg.n_head
+        Q = cfg.n_embd//cfg.n_head
+        T = cfg.block_size
+
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+
         # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0/dt)  # per second
         flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
+        return flops_achieved / flops_promised
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Take a conditioning sequence of indices idx (LongTensor of shape \
+        (b,t)) and complete the sequence max_new_tokens times, feeding the \
+        predictions back into the model each time. Most likely you'll want to \
+        make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(
-                1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # if sequence context is growing too long -> crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size \
+                else idx[:, -self.config.block_size:]
+
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+
+            # pluck logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
+
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
