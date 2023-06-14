@@ -324,7 +324,7 @@ class Trainer(object):
             for k in range(self.eval_iters):
                 X, Y = self.get_batch(split)
                 with self.ctx:
-                    logits, loss = self.model(X, Y)
+                    _, loss = self.model(X, Y)
                 losses[k] = loss.item()
             out[split] = losses.mean()
         self.model.train()
@@ -410,59 +410,52 @@ class Trainer(object):
                         self.always_save_checkpoint:
                     self.best_val_loss = losses['val']
                     if self.iter_num > 0:
-                        self.saveModel(self.out_dir + 'ckpt.pt')
+                        self.saveModel(f'{self.out_dir}ckpt.pt')
             if self.iter_num == 0 and self.eval_only:
                 break
 
-            # forward backward update, with optional gradient accumulation to simulate larger batch size
-            # and using the GradScaler if data type is float16
-            for micro_step in range(gradient_accumulation_steps):
-                if ddp:
-                    # in DDP training we only need to sync gradients at the last micro step.
-                    # the official way to do this is with model.no_sync() context manager, but
-                    # I really dislike that this bloats the code and forces us to repeat code
-                    # looking at the source of that context manager, it just toggles this variable
-                    model.require_backward_grad_sync = (
-                        micro_step == gradient_accumulation_steps - 1)
-                with ctx:
-                    logits, loss = model(X, Y)
-                    # scale the loss to account for gradient accumulation
-                    loss = loss / gradient_accumulation_steps
-                # immediately async prefetch next batch while model is doing the forward pass on the GPU
-                X, Y = get_batch('train')
-                # backward pass, with gradient scaling if training in fp16
-                scaler.scale(loss).backward()
-            # clip the gradient
-            if grad_clip != 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            # step the optimizer and scaler if training in fp16
-            scaler.step(optimizer)
-            scaler.update()
-            # flush the gradients as soon as we can, no need for this memory anymore
-            optimizer.zero_grad(set_to_none=True)
+            for micro_step in range(self.gradient_accumulation_steps):
+                if self.ddp:
+                    self.model.require_backward_grad_sync = (
+                        micro_step == self.gradient_accumulation_steps - 1)
 
-            # timing and logging
+                with self.ctx:
+                    _, loss = self.model(X, Y)
+                    loss = loss / self.gradient_accumulation_steps
+
+                X, Y = self.get_batch('train')
+
+                self.scaler.scale(loss).backward()
+
+            if self.grad_clip != 0.0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.grad_clip)
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+
             t1 = time.time()
             dt = t1 - t0
             t0 = t1
-            if iter_num % log_interval == 0 and master_process:
-                # get loss as float. note: this is a CPU-GPU sync point
-                # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-                lossf = loss.item() * gradient_accumulation_steps
+            if self.iter_num % self.log_interval == 0 and self.master_process:
+                lossf = loss.item() * self.gradient_accumulation_steps
                 if local_iter_num >= 5:  # let the training loop settle a bit
                     mfu = raw_model.estimate_mfu(
-                        batch_size * gradient_accumulation_steps, dt)
-                    running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+                        self.batch_size * self.gradient_accumulation_steps, dt)
+                    running_mfu = mfu if running_mfu == -1.0 else \
+                        0.9 * running_mfu + 0.1 * mfu
                 print(
-                    f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-            iter_num += 1
+                    f"iter {self.iter_num}: loss {lossf:.4f}, \
+                    time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            self.iter_num += 1
             local_iter_num += 1
 
             # termination conditions
-            if iter_num > max_iters:
+            if self.iter_num > self.max_iters:
                 break
 
-        if ddp:
+        if self.ddp:
             destroy_process_group()
         return True
