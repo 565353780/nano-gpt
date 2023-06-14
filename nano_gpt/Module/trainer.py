@@ -7,16 +7,15 @@ import pickle
 import time
 from contextlib import nullcontext
 
-import torch
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import destroy_process_group, init_process_group
-
+import torch
 from nano_gpt.Config.config import GPTConfig
-from nano_gpt.Model.nano import GPT
+from nano_gpt.Method.path import createFileFolder, removeFile, renameFile
 from nano_gpt.Method.time import getCurrentTime
-from nano_gpt.Method.path import createFileFolder
+from nano_gpt.Model.nano import GPT
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 
 
 class Trainer(object):
@@ -24,12 +23,10 @@ class Trainer(object):
         # -----------------------------------------------------------------------------
         # default config values designed to train a gpt2 (124M) on OpenWebText
         # I/O
-        self.out_dir = './output/'
         self.eval_interval = 2000
         self.log_interval = 1
         self.eval_iters = 200
         self.eval_only = False
-        self.always_save_checkpoint = True
         # 'scratch' or 'resume' or 'gpt2*'
         self.init_from = 'scratch'
         # wandb logging
@@ -103,10 +100,8 @@ class Trainer(object):
         self.scaler = None
 
         # logger
-        self.step = 0
         self.eval_step = 0
         self.loss_min = float('inf')
-        self.eval_loss_min = float('inf')
         self.log_folder_name = getCurrentTime()
         self.summary_writer = None
 
@@ -160,8 +155,6 @@ class Trainer(object):
         return True
 
     def loadCTX(self):
-        if self.master_process:
-            os.makedirs(self.out_dir, exist_ok=True)
         torch.manual_seed(1337 + self.seed_offset)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -199,12 +192,10 @@ class Trainer(object):
         return x.pin_memory().to(self.device, non_blocking=True), \
             y.pin_memory().to(self.device, non_blocking=True)
 
-    def resumeModel(self):
-        print(f"Resuming training from {self.out_dir}")
+    def resumeModel(self, model_file_path):
+        print(f"Resuming training from {model_file_path}")
 
-        # resume training from a checkpoint.
-        ckpt_path = os.path.join(self.out_dir, 'ckpt.pt')
-        self.checkpoint = torch.load(ckpt_path, map_location=self.device)
+        self.checkpoint = torch.load(model_file_path, map_location=self.device)
         checkpoint_model_args = self.checkpoint['model_args']
         for k in ['n_layer', 'n_head', 'n_embd',
                   'block_size', 'bias', 'vocab_size']:
@@ -224,14 +215,10 @@ class Trainer(object):
         self.iter_num = self.checkpoint['iter_num']
         self.best_val_loss = self.checkpoint['best_val_loss']
 
-        if 'step' in self.checkpoint:
-            self.step = self.checkpoint['step']
         if 'eval_step' in self.checkpoint:
             self.eval_step = self.checkpoint['eval_step']
         if 'loss_min' in self.checkpoint:
             self.loss_min = self.checkpoint['loss_min']
-        if 'eval_loss_min' in self.checkpoint:
-            self.eval_loss_min = self.checkpoint['eval_loss_min']
         if 'log_folder_name' in self.checkpoint:
             self.log_folder_name = self.checkpoint['log_folder_name']
         return True
@@ -283,6 +270,31 @@ class Trainer(object):
         self.model.to(self.device)
 
         self.loadSummaryWriter()
+        return True
+
+    def saveModel(self, save_model_file_path):
+        raw_model = self.model.module if self.ddp else self.model
+
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'model_args': self.model_args,
+            'iter_num': self.iter_num,
+            'best_val_loss': self.best_val_loss,
+            'config': self.config,
+            'eval_step': self.eval_step,
+            'loss_min': self.loss_min,
+            'log_folder_name': self.log_folder_name,
+        }
+
+        createFileFolder(save_model_file_path)
+        tmp_save_model_file_path = save_model_file_path.split(
+            ".pt")[0] + "_tmp.pt"
+
+        torch.save(checkpoint, tmp_save_model_file_path)
+
+        removeFile(save_model_file_path)
+        renameFile(tmp_save_model_file_path, save_model_file_path)
         return True
 
     def loadScaler(self):
@@ -352,108 +364,105 @@ class Trainer(object):
             param_group['lr'] = lr
         return lr
 
-    def saveModel(self, save_model_file_path):
-        raw_model = self.model.module if self.ddp else self.model
+    def evalStep(self, lr, running_mfu):
+        losses = self.estimate_loss()
 
-        checkpoint = {
-            'model': raw_model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'model_args': self.model_args,
-            'iter_num': self.iter_num,
-            'best_val_loss': self.best_val_loss,
-            'config': self.config,
-            'step': self.step,
-            'eval_step': self.eval_step,
-            'loss_min': self.loss_min,
-            'eval_loss_min': self.eval_loss_min,
-            'log_folder_name': self.log_folder_name,
-        }
+        print(
+            f"step {self.iter_num}: train loss {losses['train']:.4f}, \
+            val loss {losses['val']:.4f}")
 
-        createFileFolder(save_model_file_path)
+        self.summary_writer.add_scalar(
+            'Train/loss', losses['train'], self.iter_num)
+        self.summary_writer.add_scalar(
+            'Eval/loss', losses['val'], self.iter_num)
+        self.summary_writer.add_scalar(
+            'Param/lr', lr, self.iter_num)
+        self.summary_writer.add_scalar(
+            'Param/mfu', running_mfu*100, self.iter_num)
 
-        torch.save(checkpoint, save_model_file_path)
+        if losses['val'] < self.best_val_loss:
+            self.best_val_loss = losses['val']
+            if self.iter_num > 0:
+                self.saveModel(
+                    f'./output/{self.log_folder_name}/model_eval_best.pt')
         return True
 
     def trainStep(self):
-        return True
+        X, Y = self.get_batch('train')
+
+        for micro_step in range(self.gradient_accumulation_steps):
+            if self.ddp:
+                self.model.require_backward_grad_sync = (
+                    micro_step == self.gradient_accumulation_steps - 1)
+
+            with self.ctx:
+                _, loss = self.model(X, Y)
+                loss = loss / self.gradient_accumulation_steps
+
+            X, Y = self.get_batch('train')
+
+            self.scaler.scale(loss).backward()
+
+        if self.grad_clip != 0.0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.grad_clip)
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
+        return loss
+
+    def trainLoop(self, local_iter_num, running_mfu, t0):
+        raw_model = self.model.module if self.ddp else self.model
+
+        lr = self.updateLR()
+
+        if self.iter_num % self.eval_interval == 0 and self.master_process:
+            self.evalStep(lr, running_mfu)
+
+        # if self.iter_num == 0 and self.eval_only:
+        if self.eval_only:
+            return False
+
+        loss = self.trainStep()
+
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        if self.iter_num % self.log_interval == 0 and self.master_process:
+            lossf = loss.item() * self.gradient_accumulation_steps
+            if local_iter_num >= 5:
+                mfu = raw_model.estimate_mfu(
+                    self.batch_size * self.gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else \
+                    0.9 * running_mfu + 0.1 * mfu
+            print(
+                f"iter {self.iter_num}: loss {lossf:.4f}, \
+                time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+            self.saveModel(
+                f'./output/{self.log_folder_name}/model_last.pt')
+
+            if lossf < self.loss_min:
+                self.loss_min = lossf
+                if self.iter_num > 0:
+                    self.saveModel(
+                        f'./output/{self.log_folder_name}/model_best.pt')
+        self.iter_num += 1
+
+        return self.iter_num <= self.max_iters
 
     def train(self):
-        X, Y = self.get_batch('train')
         t0 = time.time()
         local_iter_num = 0
 
-        raw_model = self.model.module if self.ddp else self.model
         running_mfu = -1.0
         while True:
-            lr = self.updateLR()
+            if self.trainLoop(local_iter_num, running_mfu, t0):
+                local_iter_num += 1
 
-            # evaluate the loss on train/val sets and write checkpoints
-            if self.iter_num % self.eval_interval == 0 and self.master_process:
-                losses = self.estimate_loss()
-
-                print(
-                    f"step {self.iter_num}: train loss {losses['train']:.4f}, \
-                    val loss {losses['val']:.4f}")
-
-                self.summary_writer.add_scalar(
-                    'Train/iter', self.iter_num, self.step)
-                self.summary_writer.add_scalar(
-                    'Train/loss', losses['train'], self.step)
-                self.summary_writer.add_scalar(
-                    'Eval/loss', losses['val'], self.step)
-                self.summary_writer.add_scalar(
-                    'Param/lr', lr, self.step)
-                self.summary_writer.add_scalar(
-                    'Param/mfu', running_mfu*100, self.step)
-
-                if losses['val'] < self.best_val_loss or \
-                        self.always_save_checkpoint:
-                    self.best_val_loss = losses['val']
-                    if self.iter_num > 0:
-                        self.saveModel(f'{self.out_dir}ckpt.pt')
-            if self.iter_num == 0 and self.eval_only:
-                break
-
-            for micro_step in range(self.gradient_accumulation_steps):
-                if self.ddp:
-                    self.model.require_backward_grad_sync = (
-                        micro_step == self.gradient_accumulation_steps - 1)
-
-                with self.ctx:
-                    _, loss = self.model(X, Y)
-                    loss = loss / self.gradient_accumulation_steps
-
-                X, Y = self.get_batch('train')
-
-                self.scaler.scale(loss).backward()
-
-            if self.grad_clip != 0.0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.grad_clip)
-
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
-
-            t1 = time.time()
-            dt = t1 - t0
-            t0 = t1
-            if self.iter_num % self.log_interval == 0 and self.master_process:
-                lossf = loss.item() * self.gradient_accumulation_steps
-                if local_iter_num >= 5:  # let the training loop settle a bit
-                    mfu = raw_model.estimate_mfu(
-                        self.batch_size * self.gradient_accumulation_steps, dt)
-                    running_mfu = mfu if running_mfu == -1.0 else \
-                        0.9 * running_mfu + 0.1 * mfu
-                print(
-                    f"iter {self.iter_num}: loss {lossf:.4f}, \
-                    time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-            self.iter_num += 1
-            local_iter_num += 1
-
-            # termination conditions
-            if self.iter_num > self.max_iters:
+            else:
                 break
 
         if self.ddp:
