@@ -116,8 +116,7 @@ class Trainer(object):
         return
 
     def loadSummaryWriter(self):
-        self.summary_writer = SummaryWriter("./logs/" + self.log_folder_name +
-                                            "/")
+        self.summary_writer = SummaryWriter(f"./logs/{self.log_folder_name}/")
         return True
 
     def loadConfig(self):
