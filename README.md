@@ -42,7 +42,7 @@ Download mini dataset
 python data/shakespeare_char/prepare.py
 ```
 
-Train on mini dataset
+Train on mini-dataset
 
 ```bash
 python train.py config/train_shakespeare_char.py
@@ -54,7 +54,7 @@ Test trained model
 python sample.py --out_dir=out-shakespeare-char
 ```
 
-Finetune pretrained model
+Fine-tune pre-trained model
 
 ```bash
 python train.py config/finetune_shakespeare.py
