@@ -6,10 +6,11 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
+
 from nano_gpt.Config.config import GPTConfig
 from nano_gpt.Model.block import Block
 from nano_gpt.Model.layer import LayerNorm
-from torch.nn import functional as F
 
 
 class GPT(nn.Module):
