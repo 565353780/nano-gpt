@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 class Trainer(object):
-    def __init__(self):
+    def __init__(self, model_file_path):
         # -----------------------------------------------------------------------------
         # default config values designed to train a gpt2 (124M) on OpenWebText
         # I/O
@@ -109,15 +109,12 @@ class Trainer(object):
         self.loadDDP()
         self.loadCTX()
         self.loadDataset()
-        self.loadModel()
+        self.loadModel(model_file_path)
         self.loadScaler()
         self.loadOptimizer()
         self.compileModel()
+        self.warpModel()
         return
-
-    def loadSummaryWriter(self):
-        self.summary_writer = SummaryWriter(f"./logs/{self.log_folder_name}/")
-        return True
 
     def loadConfig(self):
         config_keys = [k for k, v in globals().items() if not k.startswith(
@@ -191,6 +188,10 @@ class Trainer(object):
         return x.pin_memory().to(self.device, non_blocking=True), \
             y.pin_memory().to(self.device, non_blocking=True)
 
+    def loadSummaryWriter(self):
+        self.summary_writer = SummaryWriter(f"./logs/{self.log_folder_name}/")
+        return True
+
     def resumeModel(self, model_file_path):
         print(f"Resuming training from {model_file_path}")
 
@@ -222,7 +223,7 @@ class Trainer(object):
             self.log_folder_name = self.checkpoint['log_folder_name']
         return True
 
-    def loadModel(self):
+    def loadModel(self, model_file_path):
         # attempt to derive vocab_size from the dataset
         meta_path = os.path.join(self.data_dir, 'meta.pkl')
         meta_vocab_size = None
@@ -232,7 +233,7 @@ class Trainer(object):
             meta_vocab_size = meta['vocab_size']
             print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
-        if self.init_from == 'scratch':
+        if not os.path.exists(model_file_path):
             print("Initializing a new model from scratch")
 
             if meta_vocab_size is None:
@@ -247,7 +248,7 @@ class Trainer(object):
             self.model = GPT(gptconf)
 
         elif self.init_from == 'resume':
-            self.resumeModel()
+            self.resumeModel(model_file_path)
 
         elif self.init_from.startswith('gpt2'):
             print(f"Initializing from OpenAI GPT-2 weights: {self.init_from}")
