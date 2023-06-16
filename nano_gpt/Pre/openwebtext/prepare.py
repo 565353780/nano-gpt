@@ -72,7 +72,8 @@ def prepare(dataset_folder_path):
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
 
         idx = 0
-        for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
+        for batch_idx in tqdm(range(total_batches),
+                              desc=f'writing {filename}'):
             # Batch together samples for faster write
             batch = dset.shard(num_shards=total_batches,
                                index=batch_idx,
