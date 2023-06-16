@@ -50,13 +50,14 @@ tokenized = split_dataset.map(
     num_proc=num_proc,
 )
 
+total_batches = 1024
+
 # concatenate all the ids in each dataset into one large file for train
 for split, dset in tokenized.items():
     arr_len = np.sum(dset['len'])
-    filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
+    filename = f'/home/chli/chLi/nanoGPT/openwebtext/{split}.bin'
     dtype = np.uint16  # (can do since enc.max_token_value == 50256 is < 2**16)
     arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-    total_batches = 1024
 
     idx = 0
     for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
