@@ -12,5 +12,5 @@ if __name__ == "__main__":
         '/home/chli/chLi/nanoGPT/shakespeare_char/'
 
     # prepare_openwebtext(openwebtext_dataset_folder_path)
-    # prepare_shakespeare(shapespeare_dataset_folder_path)
+    prepare_shakespeare(shapespeare_dataset_folder_path)
     prepare_shakespeare_char(shapespeare_char_dataset_folder_path)
