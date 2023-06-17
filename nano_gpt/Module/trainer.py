@@ -9,13 +9,14 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
+
 from nano_gpt.Config.config import GPTConfig
 from nano_gpt.Method.path import createFileFolder, removeFile, renameFile
 from nano_gpt.Method.time import getCurrentTime
 from nano_gpt.Model.nano import GPT
-from torch.distributed import destroy_process_group, init_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
 
 
 class Trainer(object):
@@ -29,10 +30,6 @@ class Trainer(object):
         self.eval_only = False
         # 'scratch' or 'resume' or 'gpt2*'
         self.init_from = 'scratch'
-        # wandb logging
-        self.wandb_log = False  # disabled by default
-        self.wandb_project = 'owt'
-        self.wandb_run_name = 'gpt2'  # 'run' + str(time.time())
         # data
         self.dataset = 'openwebtext'
         # used to simulate larger batch sizes
@@ -121,9 +118,7 @@ class Trainer(object):
             '_') and isinstance(v, (int, float, bool, str))]
         # overrides from command line or config file
         exec(open('nano_gpt/Config/configurator.py').read())
-        self.config = {k: globals()[k]
-                       for k in config_keys}  # will be useful for logging
-        # -----------------------------------------------------------------------------
+        self.config = {k: globals()[k] for k in config_keys}
         return True
 
     def loadDDP(self):
