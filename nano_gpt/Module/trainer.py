@@ -9,18 +9,18 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+from nano_gpt.Config.config import GPTConfig
+from nano_gpt.Config.configurator import registerConfig
+from nano_gpt.Method.path import createFileFolder, removeFile, renameFile
+from nano_gpt.Method.time import getCurrentTime
+from nano_gpt.Model.nano import GPT
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-from nano_gpt.Config.config import GPTConfig
-from nano_gpt.Method.path import createFileFolder, removeFile, renameFile
-from nano_gpt.Method.time import getCurrentTime
-from nano_gpt.Model.nano import GPT
-
 
 class Trainer(object):
-    def __init__(self, model_file_path):
+    def __init__(self, config_name, model_file_path):
         # -----------------------------------------------------------------------------
         # default config values designed to train a gpt2 (124M) on OpenWebText
         # I/O
@@ -102,7 +102,7 @@ class Trainer(object):
         self.log_folder_name = getCurrentTime()
         self.summary_writer = None
 
-        self.loadConfig()
+        self.loadConfig(config_name)
         self.loadDDP()
         self.loadCTX()
         self.loadDataset()
@@ -113,12 +113,13 @@ class Trainer(object):
         self.warpModel()
         return
 
-    def loadConfig(self):
-        config_keys = [k for k, v in globals().items() if not k.startswith(
-            '_') and isinstance(v, (int, float, bool, str))]
+    def loadConfig(self, config_name):
         # overrides from command line or config file
-        exec(open('nano_gpt/Config/configurator.py').read())
-        self.config = {k: globals()[k] for k in config_keys}
+        self.config = registerConfig(config_name)
+
+        for key, value in self.config.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
         return True
 
     def loadDDP(self):
@@ -162,10 +163,10 @@ class Trainer(object):
 
     def loadDataset(self):
         # poor man's data loader
-        self.data_dir = os.path.join('data', self.dataset)
-        self.train_data = np.memmap(os.path.join(
-            self.data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-        self.val_data = np.memmap(os.path.join(self.data_dir, 'val.bin'),
+        self.data_dir = f'/ home/chli/chLi/nanoGPT/{self.dataset}/'
+        self.train_data = np.memmap(f'{self.data_dir}train.bin',
+                                    dtype=np.uint16, mode='r')
+        self.val_data = np.memmap(f'{self.data_dir}val.bin',
                                   dtype=np.uint16, mode='r')
         return True
 
@@ -220,7 +221,7 @@ class Trainer(object):
 
     def loadModel(self, model_file_path):
         # attempt to derive vocab_size from the dataset
-        meta_path = os.path.join(self.data_dir, 'meta.pkl')
+        meta_path = f'{self.data_dir}meta.pkl'
         meta_vocab_size = None
         if os.path.exists(meta_path):
             with open(meta_path, 'rb') as f:
